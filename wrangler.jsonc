@@ -1,0 +1,33 @@
+{
+  "name": "mcp-notes",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "MyMCP"
+      }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MyMCP"] }
+  ],
+
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "<YOUR_KV_NAMESPACE_ID>"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "NOTES_DB",
+      "database_name": "mcp-notes-db",
+      "database_id": "<YOUR_D1_DATABASE_ID>"
+    }
+  ]
+}

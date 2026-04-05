@@ -1,0 +1,713 @@
+MCP Server サンプルアプリケーション実装プロンプト
+ゴール
+Cloudflare Workers 上で動く、認証付きリモート MCP サーバーのサンプルアプリケーションを実
+装してください。
+
+claude.ai の Custom Connector から接続し、Google アカウント（個人 Gmail）で認証し、許可
+リストに登録されたユーザーのみがアクセスできる構成です。
+サンプルとして「簡易メモ帳（Notes）」を題材にしてください。ユーザーがClaude.aiからメモの
+作成・一覧・検索・削除をMCPツール経由で行えるアプリです。
+
+技術スタック
+レイヤー
+MCP Server /
+OAuth Provider
+
+技術
+Cloudflare Workers +
+@cloudflare/workers-oauthprovider
+
+用途
+MCP エンドポイント + OAuth
+2.1 認可サーバー
+
+@modelcontextprotocol/sdk
+
+MCP プロトコル実装
+
+agents (Cloudflare Agents SDK)
+
+McpAgent クラス
+
+Router
+
+hono
+
+Google OAuth ハンドラ
+
+DB
+
+Cloudflare D1 (SQLite)
+
+メモデータ永続化
+
+Auth
+
+Google OAuth 2.0
+
+MCP SDK
+Agent
+Framework
+
+ユーザー認証（個人 Gmail 対
+応）
+
+OAuth トークン管理
+KV
+
+Cloudflare KV
+
+（OAuthProvider が内部で使
+用）
+
+アーキテクチャ概要
+claude.ai (Custom Connector)
+│
+│ ① GET /.well-known/oauth-protected-resource
+
+│ ② GET /.well-known/oauth-authorization-server
+│ ③ POST /register
+
+(DCR: Dynamic Client Registration)
+
+│ ④ ブラウザで /authorize → Google OAuth → /callback
+│ ⑤ POST /token
+│ ⑥ POST /mcp
+
+(認可コード → MCPアクセストークン交換)
+(Bearer token 付きでツール呼び出し)
+
+│
+▼
+Cloudflare Worker
+├── OAuthProvider（①②③⑤を自動処理）
+│
+
+└── KV (OAUTH_KV): client登録情報、トークンハッシュ
+
+├── GoogleHandler（④を処理: /authorize, /callback）
+│
+
+└── ユーザー検証: メールアドレス許可リスト（KV or 環境変数）
+
+└── MyMCP (McpAgent)（⑥を処理: ツール実行）
+└── D1 (NOTES_DB): メモデータ
+
+OAuthProvider の役割
+@cloudflare/workers-oauth-provider が提供する OAuthProvider クラスは、Worker を
+
+OAuth 2.1 認可サーバー に変えるラッパーです。以下を自動処理します:
+/.well-known/oauth-authorization-server メタデータ公開
+/.well-known/oauth-protected-resource メタデータ公開
+/register DCR エンドポイント（MCPクライアントが自動でclient_idを取得）
+/token トークン発行・PKCE検証・リフレッシュ
+/mcp へのリクエストに対する Bearer トークンゲート（無効なら401）
+
+開発者が実装するのは「誰をどう認証するか」（GoogleHandler）と「何のツールを公開するか」
+（McpAgent）だけです。
+
+フロー詳細
+1. Discovery & Registration (自動)
+claude.ai が /.well-known/oauth-protected-resource → /.well-known/oauthauthorization-server を取得
+POST /register で DCR により client_id を動的取得（KVに保存）
+
+2. Authorization (GoogleHandler が処理)
+claude.ai がブラウザで /authorize?code_challenge=... を開く
+GoogleHandler が accounts.google.com へリダイレクト
+ユーザーが Google ログイン → /callback?code=GOOGLE_CODE で戻る
+Worker が Google の code → access_token 交換 → userinfo 取得
+許可リスト照合: email で判定（KV or 環境変数の許可リスト）。拒否なら 403
+completeAuthorization() で OAuthProvider に認可コード生成を委任
+
+ブラウザ経由で claude.ai に認可コードが渡る
+3. Token Exchange (自動)
+claude.ai が POST /token で認可コード + code_verifier → MCP アクセストークン取得
+4. Tool Invocation
+claude.ai が POST /mcp に Bearer token 付きでリクエスト
+OAuthProvider がトークン検証 → OK なら McpAgent に転送
+McpAgent がツール実行（D1にクエリ等）→ 結果を返す
+
+ファイル構成
+my-mcp-notes/
+├── src/
+│
+
+├── index.ts
+
+│
+
+├── google-handler.ts
+
+│
+
+├── mcp-server.ts
+
+│
+
+└── env.d.ts
+
+├── schema.sql
+├── wrangler.jsonc
+├── package.json
+└── tsconfig.json
+
+実装詳細
+
+# エントリポイント（OAuthProvider設定）
+
+# Google OAuth フロー（/authorize, /callback）
+# McpAgent 定義（ツール登録）
+# Env 型定義
+
+# D1 初期スキーマ
+
+# Cloudflare Workers 設定
+
+1. src/env.d.ts
+interface Env {
+// Google OAuth
+GOOGLE_CLIENT_ID: string;
+GOOGLE_CLIENT_SECRET: string;
+COOKIE_ENCRYPTION_KEY: string;
+// ユーザー制限
+// JSON配列文字列: '["alice@yourcompany.com","bob@yourcompany.com"]'
+// KVに "ALLOWED_EMAILS" キーで保存してもよい
+ALLOWED_EMAILS: string;
+// Cloudflare Bindings
+OAUTH_KV: KVNamespace;
+NOTES_DB: D1Database;
+
+// OAuthProvider が内部で使用 + 許可リスト保存
+// メモデータ
+
+MCP_OBJECT: DurableObjectNamespace; // McpAgent 用 Durable Object
+}
+
+2. src/index.ts — エントリポイント
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import GoogleHandler from "./google-handler";
+import { MyMCP } from "./mcp-server";
+export { MyMCP };
+export default new OAuthProvider({
+apiRoute: "/mcp",
+apiHandler: MyMCP.serve("/mcp"),
+defaultHandler: GoogleHandler,
+authorizeEndpoint: "/authorize",
+tokenEndpoint: "/token",
+clientRegistrationEndpoint: "/register",
+});
+
+ポイント:
+MyMCP を export する（Durable Object として Workers ランタイムに認識させるため）
+OAuthProvider が全 HTTP リクエストの入口になる
+/mcp 以外のパスへのリクエストは defaultHandler （GoogleHandler）に流れる
+/mcp へのリクエストは Bearer トークン検証後に apiHandler に流れる
+
+3. src/google-handler.ts — Google OAuth フロー
+Hono を使って /authorize と /callback を実装する。
+import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { Hono } from "hono";
+const app = new Hono<{
+Bindings: Env & { OAUTH_PROVIDER: OAuthHelpers };
+}>();
+// 許可リスト取得
+async function isUserAllowed(env: Env, email: string, hd?: string): Promise<boolean> {
+// 方法1: Google Workspace ドメインで制限（Workspace利用時のみ有効、個人Gmailではhdが存在しない）
+// if (hd === "yourcompany.com") return true;
+// 方法2: KVの許可リストで制限（個人Gmail運用ではこちらを推奨）
+const raw = await env.OAUTH_KV.get("ALLOWED_EMAILS");
+if (raw) {
+const allowed: string[] = JSON.parse(raw);
+return allowed.includes(email);
+}
+// 方法3: 環境変数から
+try {
+const allowed: string[] = JSON.parse(env.ALLOWED_EMAILS || "[]");
+return allowed.includes(email);
+} catch {
+return false;
+}
+}
+// === /authorize: Google OAuth 開始 ===
+app.get("/authorize", async (c) => {
+// OAuthProvider から MCP クライアントの認可リクエスト情報をパース
+const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
+if (!oauthReqInfo.clientId) {
+return c.text("Invalid request", 400);
+}
+// Google の認可エンドポイントへリダイレクト
+const googleAuthUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+googleAuthUrl.searchParams.set("client_id", c.env.GOOGLE_CLIENT_ID);
+googleAuthUrl.searchParams.set("redirect_uri", `${new URL(c.req.url).origin}/callback`);
+googleAuthUrl.searchParams.set("response_type", "code");
+googleAuthUrl.searchParams.set("scope", "openid email profile");
+googleAuthUrl.searchParams.set("access_type", "offline");
+
+googleAuthUrl.searchParams.set("prompt", "consent");
+// MCP の認可リクエスト情報を state に埋め込む（コールバックで復元するため）
+const state = btoa(JSON.stringify({ oauthReqInfo }));
+googleAuthUrl.searchParams.set("state", state);
+return c.redirect(googleAuthUrl.toString());
+});
+// === /callback: Google OAuth コールバック ===
+app.get("/callback", async (c) => {
+const code = c.req.query("code");
+const stateParam = c.req.query("state");
+if (!code || !stateParam) {
+return c.text("Missing code or state", 400);
+}
+// 1. Google の認可コードをアクセストークンに交換
+const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+method: "POST",
+headers: { "Content-Type": "application/x-www-form-urlencoded" },
+body: new URLSearchParams({
+code,
+client_id: c.env.GOOGLE_CLIENT_ID,
+client_secret: c.env.GOOGLE_CLIENT_SECRET,
+redirect_uri: `${new URL(c.req.url).origin}/callback`,
+grant_type: "authorization_code",
+}),
+});
+const tokens = await tokenRes.json<{ access_token: string; id_token: string }>();
+if (!tokens.access_token) {
+return c.text("Failed to exchange token with Google", 500);
+}
+// 2. Google のユーザー情報を取得
+const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+headers: { Authorization: `Bearer ${tokens.access_token}` },
+});
+const googleUser = await userRes.json<{
+email: string;
+name: string;
+picture: string;
+hd?: string; // Google Workspace の hosted domain
+}>();
+
+// 3. ★ ユーザー制限 ★
+const allowed = await isUserAllowed(c.env, googleUser.email, googleUser.hd);
+if (!allowed) {
+return c.text(`Access denied: ${googleUser.email} is not authorized.`, 403);
+}
+// 4. state から MCP の認可リクエスト情報を復元
+const { oauthReqInfo } = JSON.parse(atob(stateParam));
+// 5. OAuthProvider に認可完了を通知 → MCP 用アクセストークンが生成される
+props は McpAgent 内で this.props としてアクセス可能
+
+//
+
+const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
+request: oauthReqInfo,
+userId: googleUser.email,
+metadata: { label: googleUser.name },
+scope: oauthReqInfo.scope,
+props: {
+email: googleUser.email,
+name: googleUser.name,
+},
+});
+// 6. claude.ai のコールバック URL へリダイレクト（認可コード付き）
+return c.redirect(redirectTo);
+});
+export default app;
+
+セキュリティに関する注意:
+上記の state 実装は簡略版です。本番では CSRF 対策として暗号化 Cookie と state の紐付け
+（nonce検証）が必要です
+公式テンプレート cloudflare/ai/demos/remote-mcp-github-oauth に含まれる workersoauth-utils.ts の createOAuthState / validateOAuthState /
+generateCSRFProtection / validateCSRFToken を使うことを推奨します
+
+Google Cloud Console の OAuth 同意画面は「外部」+「テストモード」で運用します。テス
+トユーザーとして登録した Gmail アドレスのみがログイン可能です（最大100人）。Google
+Workspace アカウントがあれば「内部」に設定して自社ドメインのみに制限することも可能で
+す
+
+4. src/mcp-server.ts — MCP ツール定義
+import { McpAgent } from "agents/mcp";
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+// completeAuthorization() の props で渡した型
+type AuthProps = {
+email: string;
+name: string;
+};
+export class MyMCP extends McpAgent<Env, unknown, AuthProps> {
+server = new McpServer({
+name: "mcp-notes",
+version: "1.0.0",
+});
+async init() {
+const userEmail = this.props.email;
+const userName = this.props.name;
+const db = this.env.NOTES_DB;
+// --- Tool: whoami --this.server.tool(
+"whoami",
+"現在ログイン中のユーザー情報を返す",
+{},
+async () => ({
+content: [
+{ type: "text", text: `${userName} (${userEmail})` },
+],
+})
+);
+// --- Tool: create_note --this.server.tool(
+"create_note",
+"新しいメモを作成する",
+{
+title: z.string().describe("メモのタイトル"),
+body: z.string().describe("メモの本文"),
+},
+async ({ title, body }) => {
+const id = crypto.randomUUID();
+await db
+.prepare(
+"INSERT INTO notes (id, user_email, title, body, created_at) VALUES (?, ?, ?, ?,
+)
+.bind(id, userEmail, title, body)
+
+.run();
+return {
+content: [
+{ type: "text", text: `メモを作成しました (id: ${id})` },
+],
+};
+}
+);
+// --- Tool: list_notes --this.server.tool(
+"list_notes",
+"自分のメモ一覧を取得する",
+{
+limit: z.number().optional().default(20).describe("取得件数（デフォルト20）"),
+},
+async ({ limit }) => {
+const result = await db
+.prepare(
+
+"SELECT id, title, body, created_at FROM notes WHERE user_email = ? ORDER BY crea
+)
+.bind(userEmail, limit)
+.all();
+if (!result.results.length) {
+return {
+content: [{ type: "text", text: "メモがありません。" }],
+};
+}
+const text = result.results
+.map(
+(r: any) =>
+`- [${r.id}] ${r.title} (${r.created_at})\n
+)
+.join("\n\n");
+return { content: [{ type: "text", text }] };
+}
+);
+// --- Tool: search_notes --this.server.tool(
+"search_notes",
+"メモをキーワード検索する",
+{
+
+${r.body}`
+
+query: z.string().describe("検索キーワード"),
+},
+async ({ query }) => {
+const result = await db
+.prepare(
+
+"SELECT id, title, body, created_at FROM notes WHERE user_email = ? AND (title LI
+)
+.bind(userEmail, `%${query}%`, `%${query}%`)
+.all();
+if (!result.results.length) {
+return {
+content: [
+{ type: "text", text: `「${query}」に一致するメモはありません。` },
+],
+};
+}
+const text = result.results
+.map(
+(r: any) =>
+`- [${r.id}] ${r.title} (${r.created_at})\n
+
+${r.body}`
+
+)
+.join("\n\n");
+return { content: [{ type: "text", text }] };
+}
+);
+// --- Tool: delete_note --this.server.tool(
+"delete_note",
+"メモを削除する（自分のメモのみ）",
+{
+note_id: z.string().describe("削除するメモのID"),
+},
+async ({ note_id }) => {
+const result = await db
+.prepare("DELETE FROM notes WHERE id = ? AND user_email = ?")
+.bind(note_id, userEmail)
+.run();
+if (result.meta.changes === 0) {
+return {
+content: [
+{
+type: "text",
+
+text: `メモが見つかりません（id: ${note_id}）。自分のメモのみ削除できます。`,
+},
+],
+};
+}
+return {
+content: [
+{ type: "text", text: `メモを削除しました (id: ${note_id})` },
+],
+};
+}
+);
+}
+}
+
+ポイント:
+this.props.email で認証済みユーザーのメールアドレスにアクセスできる
+
+これは google-handler.ts の completeAuthorization({ props: { email, name } })
+で渡した値
+D1 クエリで WHERE user_email = ? を常に含めることで、ユーザーは自分のメモだけにアク
+セスできる
+
+5. schema.sql — D1 初期スキーマ
+CREATE TABLE IF NOT EXISTS notes (
+id TEXT PRIMARY KEY,
+user_email TEXT NOT NULL,
+title TEXT NOT NULL,
+body TEXT NOT NULL,
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user ON notes (user_email, created_at DESC);
+
+6. wrangler.jsonc
+{
+"name": "mcp-notes",
+"main": "src/index.ts",
+"compatibility_date": "2025-04-01",
+"compatibility_flags": ["nodejs_compat"],
+
+"durable_objects": {
+"bindings": [
+{
+"name": "MCP_OBJECT",
+"class_name": "MyMCP"
+}
+]
+},
+"migrations": [
+{ "tag": "v1", "new_classes": ["MyMCP"] }
+],
+"kv_namespaces": [
+{
+"binding": "OAUTH_KV",
+"id": "<YOUR_KV_NAMESPACE_ID>"
+}
+],
+"d1_databases": [
+{
+"binding": "NOTES_DB",
+"database_name": "mcp-notes-db",
+"database_id": "<YOUR_D1_DATABASE_ID>"
+}
+]
+}
+
+7. package.json
+{
+"name": "mcp-notes",
+"private": true,
+"scripts": {
+"dev": "wrangler dev",
+"deploy": "wrangler deploy"
+},
+"dependencies": {
+"@cloudflare/workers-oauth-provider": "latest",
+"@modelcontextprotocol/sdk": "latest",
+"agents": "latest",
+"hono": "^4",
+"zod": "^3"
+},
+
+"devDependencies": {
+"@cloudflare/workers-types": "latest",
+"wrangler": "latest",
+"typescript": "^5"
+}
+}
+
+8. tsconfig.json
+{
+"compilerOptions": {
+"target": "ES2022",
+"module": "ES2022",
+"moduleResolution": "bundler",
+"lib": ["ES2022"],
+"types": ["@cloudflare/workers-types"],
+"strict": true,
+"noEmit": true,
+"skipLibCheck": true,
+"resolveJsonModule": true,
+"allowSyntheticDefaultImports": true,
+"forceConsistentCasingInFileNames": true
+},
+"include": ["src/**/*"],
+"exclude": ["node_modules"]
+}
+
+セットアップ手順
+前提条件
+Cloudflare アカウント（無料プランでOK）
+Node.js 18+
+Google Cloud Console へのアクセス（OAuth クライアント ID 作成用）
+
+手順
+# 1. プロジェクト作成
+mkdir mcp-notes && cd mcp-notes
+npm init -y
+npm install @cloudflare/workers-oauth-provider @modelcontextprotocol/sdk agents hono zod
+
+npm install -D @cloudflare/workers-types wrangler typescript
+# 2. KV ネームスペース作成
+npx wrangler kv namespace create "OAUTH_KV"
+# → 出力される ID を wrangler.jsonc の kv_namespaces[0].id に設定
+# 3. D1 データベース作成
+npx wrangler d1 create mcp-notes-db
+# → 出力される ID を wrangler.jsonc の d1_databases[0].database_id に設定
+# 4. D1 にスキーマ適用
+npx wrangler d1 execute mcp-notes-db --remote --file=schema.sql
+# 5. Google Cloud Console で OAuth 2.0 クライアント ID を作成
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+
+- Google Cloud Console → APIとサービス → 認証情報 → OAuth 2.0 クライアント ID 作成
+- アプリケーションの種類: ウェブアプリケーション
+- 承認済みリダイレクト URI:
+
+ローカル開発用: http://localhost:8787/callback
+
+本番用: https://mcp-notes.<your-subdomain>.workers.dev/callback
+
+- OAuth 同意画面の設定:
+
+ユーザーの種類: 「外部」（個人Gmailの場合はこれのみ選択可）
+公開ステータス: 「テスト」のままでOK（本番公開不要）
+
+テストユーザー: 自分のGmailアドレスを追加（最大100人まで登録可能）
+※ テストモードでは登録したユーザーしかログインできないため、
+これ自体がユーザー制限として機能する
+
+# 6. Secrets 設定
+npx wrangler secret put GOOGLE_CLIENT_ID
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+npx wrangler secret put COOKIE_ENCRYPTION_KEY
+
+# Google Console で取得した Client ID
+
+# Google Console で取得した Client Secret
+# openssl rand -hex 32 で生成
+
+# 7. 許可ユーザーを KV に登録
+npx wrangler kv key put "ALLOWED_EMAILS" \
+'["alice@yourcompany.com","bob@yourcompany.com"]' \
+--binding="OAUTH_KV"
+# 8. ローカル開発
+#
+
+.dev.vars ファイルを作成:
+
+#
+
+GOOGLE_CLIENT_ID=<your-dev-client-id>
+
+#
+
+GOOGLE_CLIENT_SECRET=<your-dev-client-secret>
+
+#
+
+COOKIE_ENCRYPTION_KEY=<random-hex-string>
+
+#
+
+ALLOWED_EMAILS=["your-email@yourcompany.com"]
+
+npx wrangler dev
+# 9. MCP Inspector で動作確認
+npx @modelcontextprotocol/inspector@latest
+# → http://localhost:5173 で Inspector を開く
+
+# → Server URL に http://localhost:8787/mcp を入力
+
+# → OAuth Settings → Quick OAuth Flow でGoogle認証
+
+# → Connect → List Tools でツール一覧が表示されれば成功
+# 10. デプロイ
+npx wrangler deploy
+# 11. claude.ai で接続
+#
+
+Settings → Connectors → Add Custom Connector
+
+#
+
+URL: https://mcp-notes.<your-subdomain>.workers.dev/mcp
+
+テスト方法
+MCP Inspector での確認項目
+1. 接続 → Google 認証リダイレクト → 認証成功で Inspector に戻る
+2. List Tools で 5 つのツール（whoami, create_note, list_notes, search_notes,
+delete_note）が表示される
+3. whoami を実行 → 認証したユーザーのメールアドレスと名前が返る
+4. create_note でメモ作成 → ID が返る
+5. list_notes で作成したメモが一覧に含まれる
+6. search_notes でキーワード検索が機能する
+7. delete_note で削除できる
+8. 許可リストに含まれないメールアドレスでログイン → 403 エラーになる
+
+claude.ai での確認
+接続後、以下のようなプロンプトで動作確認:
+「私は誰？」 → whoami が呼ばれる
+「買い物リストをメモして: 牛乳、卵、パン」 → create_note が呼ばれる
+「メモ一覧を見せて」 → list_notes が呼ばれる
+「卵に関するメモを探して」 → search_notes が呼ばれる
+
+注意事項・既知の制限
+1. state パラメータのCSRF対策: 上記実装は簡略版。本番では公式テンプレートの workersoauth-utils.ts にある暗号化 Cookie + nonce 検証を使うこと
+
+2. D1 の制限: 1DB あたり 10GB（無料枠 500MB）。大量データには向かない
+3. Durable Objects の料金: リクエストあたり課金。開発中は無料枠内に収まるが、大量アクセス
+時は注意
+
+4. ローカル開発時の D1: wrangler dev ではローカル SQLite が使われる。 --remote フラグで
+本番 D1 に接続可能
+5. Google OAuth 同意画面: 個人 Gmail では「外部」+「テストモード」で運用。テストユーザー
+
+に自分のアドレスを登録すること。Google Workspace アカウントがあれば「内部」にすること
+で自社ドメインのみに制限可能
+
+拡張のヒント
+ツール追加: mcp-server.ts の init() 内に this.server.tool(...) を追加するだけ
+権限分離: this.props にロール情報を含めて、ツール内で if
+(!this.props.permissions.includes("admin")) のように制御
+
+R2 連携: ファイルアップロード/ダウンロードツールを追加する場合、 wrangler.jsonc に R2
+バインディングを追加し、ツール内で this.env.MY_BUCKET.put(key, data) で保存
+
+

@@ -1,0 +1,26 @@
+{
+  "name": "mcp-notes",
+  "description": "Sample remote MCP notes server on Cloudflare Workers with Google OAuth and MCP Apps UI",
+  "private": true,
+  "scripts": {
+    "build:ui": "vite build && node scripts/embed-html.mjs",
+    "build": "npm run build:ui",
+    "dev": "npm run build:ui && wrangler dev",
+    "deploy": "npm run build:ui && wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "latest",
+    "@modelcontextprotocol/ext-apps": "^1.0.0",
+    "@modelcontextprotocol/sdk": "latest",
+    "agents": "latest",
+    "hono": "^4",
+    "zod": "^3 || ^4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "vite": "^8.0.3",
+    "vite-plugin-singlefile": "^2.3.2",
+    "wrangler": "latest",
+    "typescript": "^5"
+  }
+}

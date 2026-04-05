@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>メモ一覧</title>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">📝 メモ一覧</div>
+      <div class="user-info" id="user-info"></div>
+    </div>
+
+    <div class="search-section">
+      <input type="text" id="search-input" class="search-input" placeholder="メモを検索..." />
+    </div>
+
+    <div class="stats-section">
+      <span class="stats-label">メモ数:</span>
+      <span class="stats-count" id="notes-count">0</span>
+      <span class="stats-filtered" id="filtered-info"></span>
+    </div>
+
+    <div class="card" id="notes-list">
+      <div class="empty-state">メモを読み込み中...</div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/mcp-app.ts"></script>
+</body>
+</html>
